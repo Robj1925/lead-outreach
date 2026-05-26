@@ -1,0 +1,10 @@
+{
+  "name": "lead-outreach",
+  "version": "1.0.0",
+  "description": "Cold outreach SMS sender for Google Maps leads without websites",
+  "main": "outreach.js",
+  "scripts": {
+    "start": "node outreach.js",
+    "dry-run": "node outreach.js --dry-run"
+  }
+}
