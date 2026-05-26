@@ -4,7 +4,7 @@
  * Lead Cold Outreach SMS Sender
  * 
  * Reads leads from leads.csv and sends a personalized cold outreach text
- * via iMessage (using the `imsg` CLI) with a random 1–10 min delay between sends.
+ * via iMessage (using the `imsg` CLI) with a random 1–5 min delay between sends.
  * 
  * Usage:
  *   node outreach.js              # Send to all leads with valid phone numbers
@@ -55,7 +55,7 @@ const LEADS_CSV    = path.resolve('/Users/robby/Documents/Projects/google-maps-s
 const LOG_FILE     = path.resolve(__dirname, 'outreach-log.json');
 const BUSINESS_HOURS = { start: 7, end: 21 }; // 7 AM – 9 PM local time
 const MIN_DELAY_MS = 1  * 60 * 1000; // 1 minute
-const MAX_DELAY_MS = 10 * 60 * 1000; // 10 minutes
+const MAX_DELAY_MS = 5 * 60 * 1000; // 5 minutes
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI FLAGS

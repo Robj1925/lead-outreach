@@ -66,7 +66,7 @@ graph TD
 ```
 
 ### Delay & Throttling
-* Sends are separated by a random **1 to 10 minute delay** to simulate human texting cadence and prevent local Apple account flags.
+* Sends are separated by a random **1 to 5 minute delay** to simulate human texting cadence and prevent local Apple account flags.
 * In dry-run mode, these delays are simply calculated and printed in the preview table but not executed.
 
 ### Business Hours Enforcement
