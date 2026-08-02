@@ -2,3 +2,17 @@
 us_mobile_prefixes.json
 node_modules/
 outreach-log.json
+
+# Real lead data and send history (PII) — never commit
+leads.csv
+*.csv
+leads.db
+*.db
+outreach-terminal.log
+*.log
+
+# Local scratch that has held credentials — never commit
+test-airtable.js
+
+# OS cruft
+.DS_Store
