@@ -3,19 +3,25 @@
 /**
  * Lead Cold Outreach SMS Sender
  * 
- * Reads leads from leads.csv and sends a personalized cold outreach text
+ * Reads leads from a CSV and sends a personalized cold outreach text
  * via iMessage (using the `imsg` CLI) with a random 1–5 min delay between sends.
- * 
+ *
+ * DRY RUN IS THE DEFAULT. Nothing is transmitted unless you pass --send.
+ *
  * Usage:
- *   node outreach.js              # Send to all leads with valid phone numbers
- *   node outreach.js --dry-run    # Preview messages without sending
- *   node outreach.js --limit 3    # Send to first 3 leads only
- *   node outreach.js --dry-run --limit 5
+ *   node outreach.js                              # Dry run (default): preview only
+ *   node outreach.js --leads ./leads.csv          # Choose the leads CSV
+ *   node outreach.js --limit 3                    # Preview first 3 leads only
+ *   node outreach.js --send --sender "Your Name"  # LIVE send
+ *   node outreach.js --send --limit 5 --hours 9-18
+ *   node outreach.js --suppress ./do-not-contact.txt
+ *
+ * Read README.md ("Responsible Use & Legal") before sending anything.
  */
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const https = require('https');
 const http = require('http');
 
@@ -26,9 +32,33 @@ const http = require('http');
 function loadEnv() {
   const envPath = path.resolve(__dirname, '.env');
   if (!fs.existsSync(envPath)) return;
-  fs.readFileSync(envPath, 'utf8').split('\n').forEach(line => {
-    const [key, ...rest] = line.split('=');
-    if (key && rest.length) process.env[key.trim()] = rest.join('=').trim();
+  fs.readFileSync(envPath, 'utf8').split('\n').forEach(rawLine => {
+    const line = rawLine.trim();
+    // Skip blank lines and whole-line comments
+    if (!line || line.startsWith('#')) return;
+
+    const eq = line.indexOf('=');
+    if (eq === -1) return;
+
+    const key = line.slice(0, eq).trim().replace(/^export\s+/, '');
+    if (!key) return;
+
+    let value = line.slice(eq + 1).trim();
+
+    // Quoted values: take everything up to the matching closing quote and
+    // discard the rest of the line (so `KEY="a b"  # note` yields `a b`).
+    // Unquoted values: strip any trailing `#` comment.
+    const quote = value[0];
+    if (quote === '"' || quote === "'") {
+      const close = value.indexOf(quote, 1);
+      value = close === -1 ? value.slice(1) : value.slice(1, close);
+    } else {
+      const hash = value.indexOf('#');
+      if (hash !== -1) value = value.slice(0, hash);
+      value = value.trim();
+    }
+
+    process.env[key] = value;
   });
 }
 loadEnv();
@@ -48,23 +78,150 @@ if (fs.existsSync(PREFIXES_JSON)) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CONFIG
-// ─────────────────────────────────────────────────────────────────────────────
-
-const LEADS_CSV    = path.resolve('/Users/robby/Documents/Projects/google-maps-scraper/leads.csv');
-const LOG_FILE     = path.resolve(__dirname, 'outreach-log.json');
-const BUSINESS_HOURS = { start: 7, end: 21 }; // 7 AM – 9 PM local time
-const MIN_DELAY_MS = 1  * 60 * 1000; // 1 minute
-const MAX_DELAY_MS = 5 * 60 * 1000; // 5 minutes
-
-// ─────────────────────────────────────────────────────────────────────────────
 // CLI FLAGS
 // ─────────────────────────────────────────────────────────────────────────────
 
-const args     = process.argv.slice(2);
-const DRY_RUN  = args.includes('--dry-run');
-const limitArg = args.find(a => a.startsWith('--limit'));
-const LIMIT    = limitArg ? parseInt(limitArg.split('=')[1] || args[args.indexOf(limitArg) + 1]) : Infinity;
+const args = process.argv.slice(2);
+
+const HELP_TEXT = `
+Lead Cold Outreach SMS Sender
+
+DRY RUN IS THE DEFAULT. Nothing is transmitted unless you pass --send.
+
+Usage:
+  node outreach.js [options]
+
+Options:
+  --send                 Actually transmit messages. Without this, preview only.
+  --leads <file>         Path to the leads CSV      (env LEADS_CSV, default ./leads.csv)
+  --sender "Name"        Name signed on every message (env SENDER_NAME). Required for --send.
+  --suppress <file>      Do-not-contact list (default: do-not-contact.txt next to the leads CSV)
+  --hours 9-18           Business-hours window, 24h clock
+                         (env BUSINESS_HOURS_START / BUSINESS_HOURS_END, default 9-18)
+  --limit <n>            Cap how many leads are processed this run
+  -h, --help             Show this help and exit
+
+Every message ends with "Reply STOP to opt out." This cannot be disabled.
+Read README.md ("Responsible Use & Legal") before sending anything.
+`;
+
+if (args.includes('--help') || args.includes('-h')) {
+  console.log(HELP_TEXT);
+  process.exit(0);
+}
+
+/**
+ * Read the value of a `--flag value` or `--flag=value` argument.
+ * Returns null when the flag is absent, and undefined when it is present without a value.
+ */
+function flagValue(name) {
+  const idx = args.findIndex(a => a === name || a.startsWith(`${name}=`));
+  if (idx === -1) return null;
+  const arg = args[idx];
+  if (arg.includes('=')) return arg.slice(arg.indexOf('=') + 1);
+  const next = args[idx + 1];
+  if (next === undefined || next.startsWith('--')) return undefined;
+  return next;
+}
+
+function requireValue(name, value) {
+  if (value === undefined) {
+    console.error(`❌ ${name} requires a value (e.g. ${name} <value>).`);
+    process.exit(1);
+  }
+  return value;
+}
+
+// ── Live send is opt-in. Dry run is the default. ─────────────────────────────
+const SEND    = args.includes('--send');
+const DRY_RUN = !SEND;
+
+if (args.includes('--dry-run')) {
+  console.log('ℹ️  --dry-run is now the default and is no longer needed. Pass --send to transmit.');
+}
+
+// ── --limit ──────────────────────────────────────────────────────────────────
+const limitRaw = flagValue('--limit');
+let LIMIT = Infinity;
+if (limitRaw !== null) {
+  requireValue('--limit', limitRaw);
+  if (!/^\d+$/.test(limitRaw.trim()) || parseInt(limitRaw, 10) < 1) {
+    console.error(`❌ --limit expects a positive whole number, got "${limitRaw}".`);
+    process.exit(1);
+  }
+  LIMIT = parseInt(limitRaw, 10);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Leads CSV: --leads flag > LEADS_CSV env > ./leads.csv relative to CWD ────
+const leadsFlag = flagValue('--leads');
+if (leadsFlag !== null) requireValue('--leads', leadsFlag);
+const LEADS_CSV = path.resolve(leadsFlag || process.env.LEADS_CSV || './leads.csv');
+
+// ── Do-not-contact list: --suppress flag > do-not-contact.txt beside the CSV ─
+const suppressFlag = flagValue('--suppress');
+if (suppressFlag !== null) requireValue('--suppress', suppressFlag);
+const SUPPRESS_FILE = suppressFlag
+  ? path.resolve(suppressFlag)
+  : path.resolve(path.dirname(LEADS_CSV), 'do-not-contact.txt');
+const SUPPRESS_EXPLICIT = suppressFlag !== null;
+
+const LOG_FILE = path.resolve(__dirname, 'outreach-log.json');
+
+// ── Sender name: --sender flag > SENDER_NAME env. Required for a live send. ──
+const senderFlag = flagValue('--sender');
+if (senderFlag !== null) requireValue('--sender', senderFlag);
+const SENDER_NAME_RAW = (senderFlag || process.env.SENDER_NAME || '').trim();
+const SENDER_NAME = SENDER_NAME_RAW || '<YOUR NAME>';
+
+if (SEND && !SENDER_NAME_RAW) {
+  console.error('\n❌ No sender name configured, so recipients would have no idea who is texting them.');
+  console.error('   Carrier/CTIA rules require every commercial message to identify its sender.');
+  console.error('\n   Set one and try again:');
+  console.error('     node outreach.js --send --sender "Your Name"');
+  console.error('   or add SENDER_NAME=Your Name to your .env file.\n');
+  process.exit(1);
+}
+
+// ── Business hours: --hours 9-18 > BUSINESS_HOURS_* env > 9-18 default ───────
+function parseHour(value, label) {
+  const n = parseInt(value, 10);
+  if (!Number.isInteger(n) || String(n) !== String(value).trim() || n < 0 || n > 24) {
+    console.error(`❌ ${label} must be a whole number of hours between 0 and 24, got "${value}".`);
+    process.exit(1);
+  }
+  return n;
+}
+
+const BUSINESS_HOURS = { start: 9, end: 18 }; // 9 AM – 6 PM local time
+const hoursFlag = flagValue('--hours');
+if (hoursFlag !== null) {
+  requireValue('--hours', hoursFlag);
+  const m = String(hoursFlag).trim().match(/^(\d{1,2})\s*-\s*(\d{1,2})$/);
+  if (!m) {
+    console.error(`❌ --hours expects a range like 9-18, got "${hoursFlag}".`);
+    process.exit(1);
+  }
+  BUSINESS_HOURS.start = parseHour(m[1], '--hours start');
+  BUSINESS_HOURS.end   = parseHour(m[2], '--hours end');
+} else {
+  if (process.env.BUSINESS_HOURS_START) BUSINESS_HOURS.start = parseHour(process.env.BUSINESS_HOURS_START, 'BUSINESS_HOURS_START');
+  if (process.env.BUSINESS_HOURS_END)   BUSINESS_HOURS.end   = parseHour(process.env.BUSINESS_HOURS_END, 'BUSINESS_HOURS_END');
+}
+
+if (BUSINESS_HOURS.start >= BUSINESS_HOURS.end) {
+  console.error(`❌ Business hours start (${BUSINESS_HOURS.start}) must be before end (${BUSINESS_HOURS.end}).`);
+  process.exit(1);
+}
+
+const MIN_DELAY_MS = 1  * 60 * 1000; // 1 minute
+const MAX_DELAY_MS = 5 * 60 * 1000; // 5 minutes
+
+// Appended to every outgoing message. Deliberately not configurable.
+const OPT_OUT_SUFFIX = '\n\nReply STOP to opt out.';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
@@ -244,41 +401,19 @@ function normalizeLineType(raw) {
 }
 
 /**
- * Returns true if a line type can receive SMS texts.
- * Landlines cannot. Mobile and VoIP generally can.
+ * Pick one of the 6 rotating body templates for a given business name.
+ * Callers should use buildMessage(), which appends the mandatory opt-out line.
  */
-function canReceiveSMS(lineType) {
-  return lineType !== 'landline';
-}
-
-/**
- * Build the personalized outreach message for a given business name.
- * Rotates through 3 templates (Curiosity Hook, Conversational Bridge, Follow-Up) based on index.
- */
-function buildMessage(businessName, index = 0) {
-  const cleanBusinessName = businessName && businessName !== 'N/A' ? businessName : '';
-  const greetingName = cleanBusinessName || 'there';
-
-  const lowerName = cleanBusinessName.toLowerCase();
-  let industry = 'landscaping';
-  if (lowerName.includes('salon') || lowerName.includes('beauty') || lowerName.includes('hair') || lowerName.includes('nail')) {
-    industry = 'hair salons';
-  } else if (lowerName.includes('construct') || lowerName.includes('contractor') || lowerName.includes('builder') || lowerName.includes('renovat') || lowerName.includes('roofing') || lowerName.includes('paint')) {
-    industry = 'construction';
-  }
-
-  // Rotate between the 6 active templates based on the index
-  const templateIdx = index % 6;
-
+function buildMessageBody(greetingName, templateIdx) {
   if (templateIdx === 0) {
     // Template 1: The Short & Direct Curiosity Hook
-    return `Hi ${greetingName}, noticed your business has great reviews on Google but is missing a website link. Local businesses without sites usually lose ~50% of mobile search leads to competitors. I'm Robert, a professional website builder, and I'd love to build a high-speed site for your business completely free in exchange for a testimonial. Worth a 5-min look?`;
+    return `Hi ${greetingName}, noticed your business has great reviews on Google but is missing a website link. Local businesses without sites usually lose ~50% of mobile search leads to competitors. I'm ${SENDER_NAME}, a professional website builder, and I'd love to build a high-speed site for your business completely free in exchange for a testimonial. Worth a 5-min look?`;
   } else if (templateIdx === 1) {
     // Template 2: The Soft "Conversational Bridge"
-    return `Hi ${greetingName}, Robert here. Does your business currently have a website in the works? I noticed it’s not listed on your Google page yet, which often makes it harder for new clients to find your services. I'm building my portfolio and would love to build you a professional site for free in exchange for a review. Open to a quick idea for this?`;
+    return `Hi ${greetingName}, ${SENDER_NAME} here. Does your business currently have a website in the works? I noticed it’s not listed on your Google page yet, which often makes it harder for new clients to find your services. I'm building my portfolio and would love to build you a professional site for free in exchange for a review. Open to a quick idea for this?`;
   } else if (templateIdx === 2) {
-    // Template 3: The Restored Original Value Prop Template (Checkbox list)
-    return `Hi ${greetingName}! My name is Robert and I'm a professional web developer and I noticed your business doesn't have a website listed on Google.
+    // Template 3: The Original Value Prop Template (Checkbox list)
+    return `Hi ${greetingName}! My name is ${SENDER_NAME} and I'm a professional web developer and I noticed your business doesn't have a website listed on Google.
 
 A website could help you:
 ✅ Show up in Google searches
@@ -290,19 +425,29 @@ I'd love to build you one completely free in exchange for a testimonial — fast
 When would you be available for a quick 10-minute chat? 😊`;
   } else if (templateIdx === 3) {
     // Template 4: The "Free Build" Hook
-    return `Hi ${greetingName}, Robert here! I'm offering a completely free website build in exchange for a testimonial, and I noticed your Google profile doesn't have a site link yet. Would you be open to me sending over a quick mockup?`;
+    return `Hi ${greetingName}, ${SENDER_NAME} here! I'm offering a completely free website build in exchange for a testimonial, and I noticed your Google profile doesn't have a site link yet. Would you be open to me sending over a quick mockup?`;
   } else if (templateIdx === 4) {
     // Template 5: The "Portfolio Project" Pitch
-    return `Hey ${greetingName}, I'm Robert. I'm building my portfolio and making professional websites 100% free just to earn a good review. I saw your business is missing a site on Google, which makes you a perfect fit. Interested in chatting?`;
+    return `Hey ${greetingName}, I'm ${SENDER_NAME}. I'm building my portfolio and making professional websites 100% free just to earn a good review. I saw your business is missing a site on Google, which makes you a perfect fit. Interested in chatting?`;
   } else {
     // Template 6: The "Zero Cost" Value Add
-    return `Hi ${greetingName}, Robert here! I'm doing free website builds this month in exchange for a testimonial. I noticed your Google page is missing a site link and I'd love to help you capture those lost local searches. Worth a 5-min look?`;
+    return `Hi ${greetingName}, ${SENDER_NAME} here! I'm doing free website builds this month in exchange for a testimonial. I noticed your Google page is missing a site link and I'd love to help you capture those lost local searches. Worth a 5-min look?`;
   }
+}
 
-  /*
-  // Commented out: 2–3 Day "Value-Add" Follow-Up Template
-  return `Hi ${greetingName}, just following up. Is getting a website live a priority for your business this quarter? If not, no pressure. I’m happy to send over a quick mockup of what your site could look like if that’s useful.`;
-  */
+/**
+ * Build the personalized outreach message for a given business name.
+ * Rotates through the 6 templates based on the index.
+ *
+ * The opt-out line is appended here, at the single return point, so that no
+ * template can ever go out without it. There is no flag to turn it off.
+ */
+function buildMessage(businessName, index = 0) {
+  const cleanBusinessName = businessName && businessName !== 'N/A' ? businessName : '';
+  const greetingName = cleanBusinessName || 'there';
+
+  const body = buildMessageBody(greetingName, index % 6);
+  return body + OPT_OUT_SUFFIX;
 }
 
 /**
@@ -332,6 +477,62 @@ function currentTimeString() {
 }
 
 /**
+ * Render a 24-hour clock hour (0–24) as a 12-hour string, e.g. 0 → "12:00 AM",
+ * 9 → "9:00 AM", 13 → "1:00 PM", 24 → "12:00 AM".
+ */
+function formatHour12(hour24) {
+  const h = ((hour24 % 24) + 24) % 24;
+  const suffix = h < 12 ? 'AM' : 'PM';
+  const display = h % 12 === 0 ? 12 : h % 12;
+  return `${display}:00 ${suffix}`;
+}
+
+function businessHoursLabel() {
+  return `${formatHour12(BUSINESS_HOURS.start)} – ${formatHour12(BUSINESS_HOURS.end)}`;
+}
+
+/**
+ * Load the do-not-contact list: one phone number per line, `#` comments and
+ * blank lines ignored. Numbers are normalized so any common US format matches.
+ * Returns a Set of E.164 numbers (empty if the file does not exist).
+ */
+function loadSuppressionList(file) {
+  const result = { numbers: new Set(), exists: false, unparsed: 0 };
+  if (!fs.existsSync(file)) return result;
+  result.exists = true;
+
+  for (const rawLine of fs.readFileSync(file, 'utf8').split('\n')) {
+    let line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    // Allow trailing comments: "+15551234567  # asked to stop"
+    const hash = line.indexOf('#');
+    if (hash !== -1) line = line.slice(0, hash).trim();
+    if (!line) continue;
+
+    const normalized = normalizePhone(line);
+    if (normalized) result.numbers.add(normalized);
+    else result.unparsed++;
+  }
+  return result;
+}
+
+/**
+ * Abort early if the `imsg` CLI is not installed, rather than failing on every
+ * lead while still sleeping minutes between each one.
+ */
+function assertImsgAvailable() {
+  try {
+    execFileSync('which', ['imsg'], { stdio: 'ignore' });
+  } catch {
+    console.error('\n❌ The `imsg` CLI was not found on your PATH, so nothing can be sent.');
+    console.error('\n   Install it with Homebrew:');
+    console.error('     brew install steipete/tap/imsg');
+    console.error('\n   (Live sending is macOS-only. Dry runs work without imsg.)\n');
+    process.exit(1);
+  }
+}
+
+/**
  * Load the outreach log (array of previously sent entries).
  */
 function loadLog() {
@@ -357,9 +558,9 @@ function appendLog(entry) {
  * Throws if imsg exits with a non-zero code.
  */
 function sendMessage(phone, message) {
-  // Escape single quotes inside the message for shell safety
-  const escaped = message.replace(/'/g, "'\\''");
-  execSync(`imsg send --to "${phone}" --text '${escaped}'`, { stdio: 'inherit' });
+  // execFile (not a shell string): CSV-derived text is passed as an argv entry,
+  // so quotes, backticks, $() and friends are never interpreted by a shell.
+  execFileSync('imsg', ['send', '--to', phone, '--text', message], { stdio: 'inherit' });
 }
 
 /**
@@ -396,26 +597,47 @@ async function main() {
   console.log('╚══════════════════════════════════════════════╝\n');
 
   if (DRY_RUN) {
-    console.log('🔍 DRY RUN MODE — no messages will be sent\n');
+    console.log('🔍 DRY RUN MODE (default) — no messages will be sent. Pass --send to transmit.\n');
+  } else {
+    console.log(`🚨 LIVE SEND MODE — messages will actually be transmitted as "${SENDER_NAME}".\n`);
+    // Fail fast if imsg is missing, before burning minutes sleeping between leads.
+    assertImsgAvailable();
   }
 
   // 1. Load leads CSV
   if (!fs.existsSync(LEADS_CSV)) {
-    console.error(`❌ leads.csv not found at: ${LEADS_CSV}`);
+    console.error(`❌ Leads CSV not found at: ${LEADS_CSV}`);
+    console.error('   Pass --leads <file>, set LEADS_CSV, or create ./leads.csv.');
+    console.error('   See leads.example.csv for the required columns (Name, Phone, Address).');
     process.exit(1);
   }
 
   const raw   = fs.readFileSync(LEADS_CSV, 'utf8');
   const leads = parseCSV(raw);
-  console.log(`📋 Loaded ${leads.length} total rows from leads.csv`);
+  console.log(`📋 Loaded ${leads.length} total rows from ${LEADS_CSV}`);
 
   // 2. Load existing log to skip already-contacted numbers
   const log             = loadLog();
   const alreadySentNums = new Set(log.map(e => e.phone));
   console.log(`📁 Log file: ${LOG_FILE}`);
   if (alreadySentNums.size > 0) {
-    console.log(`⏭️  Skipping ${alreadySentNums.size} already-contacted number(s)\n`);
+    console.log(`⏭️  Skipping ${alreadySentNums.size} already-contacted number(s)`);
   }
+
+  // 2b. Load the do-not-contact list
+  const suppression = loadSuppressionList(SUPPRESS_FILE);
+  if (suppression.exists) {
+    console.log(`🚫 Do-not-contact list: ${SUPPRESS_FILE} (${suppression.numbers.size} number(s))`);
+    if (suppression.unparsed > 0) {
+      console.log(`   ⚠️  ${suppression.unparsed} line(s) in the list could not be read as phone numbers and were ignored.`);
+    }
+  } else if (SUPPRESS_EXPLICIT) {
+    console.error(`❌ Do-not-contact file not found: ${SUPPRESS_FILE}`);
+    process.exit(1);
+  } else {
+    console.log(`🚫 No do-not-contact list found at ${SUPPRESS_FILE} (optional — see do-not-contact.example.txt)`);
+  }
+  console.log('');
 
   // 3. Filter to valid, uncontacted leads + check line type
   const hasApiKeys = !!(NUMVERIFY_API_KEY || ABSTRACT_API_KEY);
@@ -430,6 +652,7 @@ async function main() {
   }
 
   const queue = [];
+  let suppressedCount = 0;
   for (const lead of leads) {
     const phone = normalizePhone(lead.Phone);
     if (!phone) {
@@ -438,6 +661,11 @@ async function main() {
     }
     if (alreadySentNums.has(phone)) {
       console.log(`  ⏭️  Skipping "${lead.Name}" (${phone}) — already contacted`);
+      continue;
+    }
+    if (suppression.numbers.has(phone)) {
+      suppressedCount++;
+      console.log(`  🚫 Skipping "${lead.Name}" (${phone}) — on the do-not-contact list`);
       continue;
     }
 
@@ -467,6 +695,9 @@ async function main() {
   // 4. Apply --limit
   const toSend = queue.slice(0, LIMIT);
 
+  if (suppressedCount > 0) {
+    console.log(`\n🚫 ${suppressedCount} lead(s) removed by the do-not-contact list`);
+  }
   console.log(`\n✅ ${toSend.length} lead(s) queued for outreach\n`);
 
   if (toSend.length === 0) {
@@ -476,8 +707,8 @@ async function main() {
 
   // 5. Business hours check (skip in dry-run)
   if (!DRY_RUN && !isBusinessHours()) {
-    console.log(`⏰ Current time is ${currentTimeString()} — outside business hours (${BUSINESS_HOURS.start}:00 AM – ${BUSINESS_HOURS.end - 12}:00 PM).`);
-    console.log('   Run again during business hours, or use --dry-run to preview.\n');
+    console.log(`⏰ Current time is ${currentTimeString()} — outside business hours (${businessHoursLabel()}).`);
+    console.log('   Run again during business hours, or run without --send to preview.\n');
     process.exit(0);
   }
   // 6. Print dry-run preview table
@@ -500,24 +731,35 @@ async function main() {
       console.log(`[Template T${t + 1}] for "${toSend[t].Name}":`);
       console.log('┌' + '─'.repeat(76) + '┐');
       const msg = buildMessage(toSend[t].Name, t);
-      // Word wrap message lines around 74 chars for neat terminal display
-      const words = msg.split(/\s+/);
-      let currentLine = '';
-      words.forEach(w => {
-        if ((currentLine + w).length > 72) {
-          console.log('│ ' + currentLine.padEnd(74) + ' │');
-          currentLine = w + ' ';
-        } else {
-          currentLine += w + ' ';
+      // Word wrap around 74 chars, preserving the message's own line breaks so
+      // the mandatory opt-out line stays visible in the preview.
+      msg.split('\n').forEach(sourceLine => {
+        if (sourceLine.trim() === '') {
+          console.log('│ ' + ''.padEnd(74) + ' │');
+          return;
+        }
+        let currentLine = '';
+        sourceLine.trim().split(/\s+/).forEach(w => {
+          if ((currentLine + w).length > 72) {
+            console.log('│ ' + currentLine.trim().padEnd(74) + ' │');
+            currentLine = w + ' ';
+          } else {
+            currentLine += w + ' ';
+          }
+        });
+        if (currentLine.trim()) {
+          console.log('│ ' + currentLine.trim().padEnd(74) + ' │');
         }
       });
-      if (currentLine) {
-        console.log('│ ' + currentLine.trim().padEnd(74) + ' │');
-      }
       console.log('└' + '─'.repeat(76) + '┘\n');
     }
     
-    console.log('✅ Dry run complete. Run without --dry-run to send for real.\n');
+    if (!SENDER_NAME_RAW) {
+      console.log('⚠️  No sender name set, so the previews above show the "<YOUR NAME>" placeholder.');
+      console.log('   A live send requires --sender "Your Name" (or SENDER_NAME in .env).\n');
+    }
+    console.log(`⏰ Live sends are restricted to business hours (${businessHoursLabel()}).`);
+    console.log('✅ Dry run complete. Nothing was sent. Add --send to send for real.\n');
     process.exit(0);
   }
 
@@ -568,7 +810,7 @@ async function main() {
 
       // Re-check business hours after each delay
       if (!isBusinessHours()) {
-        console.log(`\n⏰ Outside business hours now (${currentTimeString()}). Pausing until 9:00 AM tomorrow.`);
+        console.log(`\n⏰ Outside business hours now (${currentTimeString()}). Pausing until ${formatHour12(BUSINESS_HOURS.start)} tomorrow.`);
         console.log(`   ${toSend.length - i - 1} lead(s) remaining. Re-run the script in the morning.\n`);
         break;
       }

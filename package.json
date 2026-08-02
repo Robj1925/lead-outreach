@@ -3,8 +3,12 @@
   "version": "1.0.0",
   "description": "Cold outreach SMS sender for Google Maps leads without websites",
   "main": "outreach.js",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14"
+  },
   "scripts": {
     "start": "node outreach.js",
-    "dry-run": "node outreach.js --dry-run"
+    "dry-run": "node outreach.js"
   }
 }

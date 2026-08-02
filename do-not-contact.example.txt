@@ -1,0 +1,20 @@
+# Do-not-contact list (suppression list)
+#
+# Copy this file to `do-not-contact.txt` and add every number that must never
+# be messaged again. By default the script looks for `do-not-contact.txt` in the
+# same directory as your leads CSV; override with `--suppress <file>`.
+#
+# Rules:
+#   - One phone number per line
+#   - Lines starting with # are comments, blank lines are ignored
+#   - A trailing # comment on a number line is allowed
+#   - Any common US format works: +15551234567, (555) 123-4567, 555-123-4567
+#
+# ADD A NUMBER HERE THE MOMENT SOMEONE REPLIES STOP, asks you not to contact
+# them, or is added to a suppression request. Honouring opt-outs is not optional.
+#
+# Examples below use the reserved 555 range and are not real numbers.
+
++15550100001          # replied STOP
+(555) 010-0002        # asked by email not to be contacted
+555-010-0003          # wrong number, reached a private individual
